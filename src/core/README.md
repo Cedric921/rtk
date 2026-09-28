@@ -26,7 +26,29 @@ Core infrastructure shared by all RTK command modules. Every filter, tracker, an
 | `split_for_classify(cmd)` | Segments for classification only — not safe for permission/security decisions | `discover/registry.rs::split_command_chain` |
 | `contains_unattestable_construct(cmd)` | True for command/process substitution, quoting the lexer reads differently from bash (`$'\''`), or a file-target redirect — constructs the permission gate can't decompose and must never auto-allow | `hooks/permissions.rs::check_command_with_rules`, `hooks/decision.rs`, `hooks/hook_cmd.rs` (Codex payloads), `discover/mod.rs` |
 
-`pub(crate)` scanning helpers are shared with the rewriter's own token walks, which must read quoting and substitutions exactly as the segmenter does: `QuoteScan`, `CaseTracker`, `SubstitutionDepth`, `word_spans`, `coalesce_words`, `is_crlf_at`, `ansi_c_quote_defeats_lexer` and `redirect_has_file_target` (all used by `discover/registry.rs`), and `is_word_boundary_whitespace` (also used by `hooks/permissions.rs::command_matches_pattern`). A change to any of them changes where the rewriter and the permission gate see a word or a segment end.
+`pub(crate)` scanning helpers are shared with the rewriter's own token walks, which must read quoting and substitutions exactly as the segmenter does: `QuoteScan`, `CaseTracker`, `SubstitutionDepth`, `words` (the shell words of a text as `Word`s — a text/span pair a caller can index through), `coalesce_words`, `Tok`/`tok_view` (a token borrowed from the text it was lexed from, so a slice of a lex costs no `String` per token), `shell_split_from_tokens`, `is_crlf_at`, `ansi_c_quote_defeats_lexer` and `redirect_has_file_target` (all used by `discover/registry.rs`), and `is_word_boundary_whitespace` (also used by `hooks/permissions.rs::command_matches_pattern`). A change to any of them changes where the rewriter and the permission gate see a word or a segment end.
+
+### Segment edits (`cmdline/edit.rs`)
+
+A consumer that decides a rewrite by peeling a segment's transparent layers —
+today, `discover/registry.rs`'s rewrite of env assignments, built-in
+wrappers, process wrappers and user-configured prefixes — lexes the whole
+compound line once, and every segment or pipeline stage takes its own
+slice of that one lex (`CompoundLex::trimmed_slice`, rebasing its tokens and
+words to the trimmed text and truncating an entry glued to a trailing byte
+`trim` stripped; a slice that starts inside an entry — `trim` stripped a byte
+`tokenize` glues to what follows, even to a redirect's fd digit — is lexed
+afresh instead). It then walks the slice's layers in a flat pass; what a
+layer is, and what kind of layer it is (`Layer`, `LayerKind`, `Walk`), is
+registry knowledge and lives, private, in `discover/registry.rs`.
+`cmdline::edit::{Edit, apply_edits}` is the generic, crate-internal half:
+a decision becomes a rewrite as a small list of `Edit` spans (each a
+replacement, or an insertion when its own start and end coincide) against
+the segment's own bytes, and `apply_edits` applies them in one validated
+pass — rejecting overlaps and non-`char`-boundary spans instead of
+panicking, since this sits on a hook's rewrite path and a bad edit must fall
+back to the unchanged segment, never break the command — keeping every byte
+no edit names (gaps, quotes, CRLF).
 
 The permission gate, discover/analytics classification, and rewrite all agree on where a command begins and ends — one `segment(cmd, Policy)` decides, and the three `Policy` constants name the only differences that remain: whether a newline or a lone `\r` ends a segment, whether `$( )` is descended into, and whether a redirect is kept or excised. `split_for_permissions`'s doc comment carries the full comparison, and `discover/registry.rs`'s `segmenter_agreement` tests hold each remaining difference to a stated reason. Those differences still matter at the call site: the gate must never under-segment, because a segment it never sees is a command its rules never check, so don't reuse `split_for_classify` or `rewrite_compound`'s segmenting for a permission/security decision — use `split_for_permissions`.
 

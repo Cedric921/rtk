@@ -158,8 +158,18 @@ impl Iterator for QuoteScan<'_> {
     }
 }
 
-/// The shell words of `cmd`, as byte ranges, with a quoted span counted as one
-/// word however many blanks it holds.
+/// One shell word located in a text: its span and its text, so a caller
+/// advancing a cursor through several of these — via [`words`] — finds where
+/// each starts and ends without scanning the text behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Word<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+/// The shell words of `cmd`, with a quoted span counted as one word however
+/// many blanks it holds.
 ///
 /// [`coalesce_words`] answers a different question: it merges *adjacent* tokens,
 /// so `D='a b'` comes back as two words. That is right for argv and wrong for
@@ -169,9 +179,16 @@ impl Iterator for QuoteScan<'_> {
 ///
 /// Escapes need no special handling here because [`QuoteScan`] never yields an
 /// escaped byte, so the space in `a\ b` is not a blank.
-pub(crate) fn word_spans(cmd: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
+pub(crate) fn words(cmd: &str) -> Vec<Word<'_>> {
+    let mut found = Vec::new();
     let mut start: Option<usize> = None;
+    let mut push = |start: usize, end: usize| {
+        found.push(Word {
+            text: &cmd[start..end],
+            start,
+            end,
+        });
+    };
 
     // Every byte, escaped ones included: a `\'` on its own is a word, and
     // `a\ b` is one word rather than two.
@@ -180,7 +197,7 @@ pub(crate) fn word_spans(cmd: &str) -> Vec<(usize, usize)> {
             !c.escaped && !c.in_single && !c.in_double && (c.byte == b' ' || c.byte == b'\t');
         if blank {
             if let Some(from) = start.take() {
-                spans.push((from, c.index));
+                push(from, c.index);
             }
         } else if start.is_none() {
             start = Some(c.index);
@@ -188,9 +205,9 @@ pub(crate) fn word_spans(cmd: &str) -> Vec<(usize, usize)> {
     }
 
     if let Some(from) = start {
-        spans.push((from, cmd.len()));
+        push(from, cmd.len());
     }
-    spans
+    found
 }
 
 /// Only `\'` inside `$'…'` diverges: bash keeps the string open, the lexer
@@ -241,12 +258,64 @@ pub(crate) fn is_crlf_at(bytes: &[u8], i: usize) -> bool {
     bytes.get(i) == Some(&b'\r') && bytes.get(i + 1) == Some(&b'\n')
 }
 
+/// A token borrowed from the text it was lexed from: what a caller holds when
+/// it needs a slice of some larger lex (one segment or stage of a compound
+/// line) without an owned `String` per token. `value` is the bytes
+/// `input[offset..offset + value.len()]` of the text `offset` indexes, same as
+/// [`ParsedToken::value`] — except for a newline operator (`"\n"`), which
+/// also stands for the `\r` of a CRLF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Tok<'a> {
+    pub(crate) kind: TokenKind,
+    pub(crate) value: &'a str,
+    pub(crate) offset: usize,
+}
+
+impl ParsedToken {
+    /// This token as a [`Tok`] borrowing its own `value`.
+    pub(crate) fn as_tok(&self) -> Tok<'_> {
+        Tok {
+            kind: self.kind,
+            value: &self.value,
+            offset: self.offset,
+        }
+    }
+}
+
+/// [`Tok`]s for `tokens`, all of which must have been lexed from `input`
+/// itself (so each `value` is `input[offset..offset + len]`), borrowed from
+/// `input` rather than from the tokens. Lazy: a caller that only walks them
+/// once never builds a `Vec`.
+pub(crate) fn tok_view<'a, 't>(
+    input: &'a str,
+    tokens: &'t [ParsedToken],
+) -> impl Iterator<Item = Tok<'a>> + 't
+where
+    'a: 't,
+{
+    tokens.iter().map(|t| Tok {
+        kind: t.kind,
+        // The one token whose text is not the bytes it covers: a newline
+        // operator is spelled `\n` even where it stands for the `\r` of a CRLF.
+        value: if t.kind == TokenKind::Operator && t.value == "\n" {
+            "\n"
+        } else {
+            &input[t.offset..t.offset + t.value.len()]
+        },
+        offset: t.offset,
+    })
+}
+
 /// Merges `tokenize()` tokens that are directly adjacent in `cmd` (no gap)
 /// into single words — e.g. `*.yml` tokenizes as `Shellism("*")` +
-/// `Arg(".yml")` but is one bash word. For callers that only need "was there
-/// a space here", not full shell-operator awareness.
-pub(crate) fn coalesce_words<'a>(cmd: &'a str, tokens: &[ParsedToken]) -> Vec<(&'a str, usize)> {
-    let mut words = Vec::new();
+/// `Arg(".yml")` but is one bash word. For callers that only need "was there a
+/// space here", not full shell-operator awareness. `tokens` are relative to
+/// `cmd` (see [`tok_view`]); each word comes back with its offset.
+pub(crate) fn coalesce_words<'a, 't>(
+    cmd: &'a str,
+    tokens: impl IntoIterator<Item = Tok<'t>>,
+) -> Vec<(&'a str, usize)> {
+    let mut merged = Vec::new();
     let mut run_start: Option<usize> = None;
     let mut run_end: usize = 0;
 
@@ -254,7 +323,7 @@ pub(crate) fn coalesce_words<'a>(cmd: &'a str, tokens: &[ParsedToken]) -> Vec<(&
         if let Some(start) = run_start
             && tok.offset != run_end
         {
-            words.push((&cmd[start..run_end], start));
+            merged.push((&cmd[start..run_end], start));
             run_start = None;
         }
         if run_start.is_none() {
@@ -263,9 +332,9 @@ pub(crate) fn coalesce_words<'a>(cmd: &'a str, tokens: &[ParsedToken]) -> Vec<(&
         run_end = tok.offset + tok.value.len();
     }
     if let Some(start) = run_start {
-        words.push((&cmd[start..run_end], start));
+        merged.push((&cmd[start..run_end], start));
     }
-    words
+    merged
 }
 
 fn tokenize_inner(input: &str, newline_mode: NewlineMode) -> Vec<ParsedToken> {
@@ -585,7 +654,8 @@ pub fn contains_unattestable_construct(cmd: &str) -> bool {
     if ansi_c_quote_defeats_lexer(cmd) {
         return true;
     }
-    let tokens = tokenize(cmd);
+    let parsed = tokenize(cmd);
+    let tokens: Vec<Tok<'_>> = tok_view(cmd, &parsed).collect();
     tokens
         .iter()
         .enumerate()
@@ -615,8 +685,8 @@ fn is_grammar_word(value: &str) -> bool {
 
 // `>&N`/`>&-` (and `N>&M`) is fd-dup/close; bare `>&` before a word is
 // `>word 2>&1` — a file target.
-pub(crate) fn redirect_has_file_target(tokens: &[ParsedToken], i: usize) -> bool {
-    let value = &tokens[i].value;
+pub(crate) fn redirect_has_file_target(tokens: &[Tok<'_>], i: usize) -> bool {
+    let value = tokens[i].value;
     // `<&` duplicates a descriptor exactly as `>&` does, and the tokenizer
     // only folds digits or `-` after either, so neither can name a file.
     if let Some(pos) = value.find(">&").or_else(|| value.find("<&")) {
@@ -757,8 +827,8 @@ impl CaseTracker {
 
     /// Reads one token. `case` is the keyword only in command position, so
     /// that the `case` in `echo case` stays an ordinary word.
-    pub(crate) fn observe(&mut self, tok: &ParsedToken, at_command_position: bool) {
-        match (&tok.kind, tok.value.as_str()) {
+    pub(crate) fn observe(&mut self, tok: Tok<'_>, at_command_position: bool) {
+        match (&tok.kind, tok.value) {
             (TokenKind::Arg, "case") if at_command_position => {
                 self.0.push(CaseState::AwaitingIn);
             }
@@ -810,11 +880,11 @@ impl SubstitutionDepth {
     /// Take `tok` into account, and say whether it was the bracketing of a
     /// substitution — the `(` that opens one or the `)` that closes it — which
     /// is never a boundary in its own right.
-    pub(crate) fn absorbs(&mut self, cmd: &str, tok: &ParsedToken) -> bool {
+    pub(crate) fn absorbs(&mut self, cmd: &str, tok: Tok<'_>) -> bool {
         if tok.kind != TokenKind::Shellism {
             return false;
         }
-        match tok.value.as_str() {
+        match tok.value {
             // Brackets nest, so one inside a substitution counts too: without
             // that its `)` closes the substitution a bracket early and the real
             // closing `)` reads as a boundary.
@@ -858,7 +928,8 @@ pub(crate) fn segment(cmd: &str, policy: Policy) -> Vec<Segment<'_>> {
         let at_command_position = !seg_has_text;
         // The gate descends into a substitution, so for it the tracker never
         // engages and everything inside is read as ordinary commands.
-        let bracketing = !policy.descend_into_substitution && substitution.absorbs(trimmed, tok);
+        let bracketing =
+            !policy.descend_into_substitution && substitution.absorbs(trimmed, tok.as_tok());
         let is_boundary = !bracketing
             && !substitution.is_inside()
             && match tok.kind {
@@ -920,7 +991,7 @@ pub(crate) fn segment(cmd: &str, policy: Policy) -> Vec<Segment<'_>> {
             seg_has_text = true;
         }
 
-        cases.observe(tok, at_command_position);
+        cases.observe(tok.as_tok(), at_command_position);
         i += 1;
     }
 
@@ -1038,7 +1109,23 @@ fn resolve_word_text(raw: &str) -> String {
 /// straight to `Command::new`/exec or compare it against literal words
 /// (`hooks/mod.rs::is_claude_hook_command`, `rtk proxy` arg-splitting).
 pub fn shell_split(input: &str) -> Vec<String> {
-    coalesce_words(input, &tokenize(input))
+    shell_split_from_tokens(input, tok_view(input, &tokenize(input)))
+}
+
+/// [`shell_split`], for a caller that already has `input`'s tokens.
+///
+/// `tokens` must be relative to `input` itself — every `offset` and
+/// `offset + value.len()` a valid index into it, as if `tokenize(input)` had
+/// produced them — and lexed from a neutral quote state at `input[0]`: a
+/// slice of a larger lex whose first token started inside an open quote reads
+/// differently here than a fresh lex of `input` would. A caller that cannot
+/// promise both re-lexes instead; out-of-range offsets panic in the slicing
+/// below.
+pub(crate) fn shell_split_from_tokens<'t>(
+    input: &str,
+    tokens: impl IntoIterator<Item = Tok<'t>>,
+) -> Vec<String> {
+    coalesce_words(input, tokens)
         .into_iter()
         .map(|(raw, _)| resolve_word_text(raw))
         .collect()
@@ -1100,53 +1187,72 @@ mod tests {
         scan.balanced()
     }
 
-    /// `word_spans` decides where a word ends for anyone who needs to know —
+    /// `words` decides where a word ends for anyone who needs to know —
     /// `split_env_prefix` among them — so it is worth asserting on its own
     /// rather than only through a caller that happens to exercise it.
     #[test]
-    fn test_word_spans_reads_a_quoted_span_as_one_word() {
-        fn words(cmd: &str) -> Vec<&str> {
-            word_spans(cmd)
-                .into_iter()
-                .map(|(from, to)| &cmd[from..to])
-                .collect()
+    fn test_words_reads_a_quoted_span_as_one_word() {
+        fn texts(cmd: &str) -> Vec<&str> {
+            words(cmd).into_iter().map(|w| w.text).collect()
         }
 
-        assert_eq!(words("git status"), vec!["git", "status"]);
+        assert_eq!(texts("git status"), vec!["git", "status"]);
         assert_eq!(
-            words("D='# shellcheck disable=SC2034' git status"),
+            texts("D='# shellcheck disable=SC2034' git status"),
             vec!["D='# shellcheck disable=SC2034'", "git", "status"]
         );
-        assert_eq!(words("FOO=\"a b\" ls"), vec!["FOO=\"a b\"", "ls"]);
+        assert_eq!(texts("FOO=\"a b\" ls"), vec!["FOO=\"a b\"", "ls"]);
         assert_eq!(
-            words("a\\ b c"),
+            texts("a\\ b c"),
             vec!["a\\ b", "c"],
             "an escaped blank joins"
         );
-        assert_eq!(words("a\tb"), vec!["a", "b"], "a tab separates");
-        assert_eq!(words("echo \"a'b'c\" x"), vec!["echo", "\"a'b'c\"", "x"]);
-        assert_eq!(words("echo '' x"), vec!["echo", "''", "x"]);
-        assert_eq!(words("café日本語 x"), vec!["café日本語", "x"]);
+        assert_eq!(texts("a\tb"), vec!["a", "b"], "a tab separates");
+        assert_eq!(texts("echo \"a'b'c\" x"), vec!["echo", "\"a'b'c\"", "x"]);
+        assert_eq!(texts("echo '' x"), vec!["echo", "''", "x"]);
+        assert_eq!(texts("café日本語 x"), vec!["café日本語", "x"]);
         // A word of nothing but escapes is still a word, which is why this
         // reads the whole scan rather than only the bytes that are syntax.
-        assert_eq!(words(r"git status \'"), vec!["git", "status", r"\'"]);
-        assert_eq!(words(r"\' foo"), vec![r"\'", "foo"]);
-        assert_eq!(words(r"a \' b"), vec!["a", r"\'", "b"]);
+        assert_eq!(texts(r"git status \'"), vec!["git", "status", r"\'"]);
+        assert_eq!(texts(r"\' foo"), vec![r"\'", "foo"]);
+        assert_eq!(texts(r"a \' b"), vec!["a", r"\'", "b"]);
 
-        assert!(words("").is_empty());
-        assert!(words("   \t  ").is_empty());
-        assert_eq!(words("  ls  "), vec!["ls"], "outer blanks are not words");
+        assert!(texts("").is_empty());
+        assert!(texts("   \t  ").is_empty());
+        assert_eq!(texts("  ls  "), vec!["ls"], "outer blanks are not words");
     }
 
     /// Nothing here should panic or lose a byte, however the quoting ends.
     #[test]
-    fn test_word_spans_survives_unfinished_quoting() {
+    fn test_words_survives_unfinished_quoting() {
         for cmd in ["echo 'abc", "echo \"abc", "echo abc\\", "'", "\\"] {
-            for (from, to) in word_spans(cmd) {
+            for word in words(cmd) {
+                let (from, to) = (word.start, word.end);
                 assert!(from < to && to <= cmd.len(), "bad span in {cmd:?}");
                 assert!(cmd.is_char_boundary(from) && cmd.is_char_boundary(to));
+                assert_eq!(word.text, &cmd[from..to]);
             }
         }
+    }
+
+    /// Each word carries its span and the text that span names, so a caller
+    /// walking a cursor through them never slices the source back out by hand.
+    #[test]
+    fn test_words_carry_their_span_and_text() {
+        let cmd = "FOO='a b' git status";
+        let found = words(cmd);
+        for word in &found {
+            assert_eq!(word.text, &cmd[word.start..word.end]);
+        }
+        assert_eq!(
+            found.iter().map(|w| (w.start, w.end)).collect::<Vec<_>>(),
+            vec![(0, 9), (10, 13), (14, 20)]
+        );
+        assert_eq!(
+            found.iter().map(|w| w.text).collect::<Vec<_>>(),
+            vec!["FOO='a b'", "git", "status"]
+        );
+        assert!(words("").is_empty());
     }
 
     /// `$'…'` is read as a plain `'…'`, so the backslash inside it closes the
@@ -1154,11 +1260,10 @@ mod tests {
     /// scanner and is why `ansi_c_quote_defeats_lexer` exists as a separate
     /// guard; pinned here so the limitation is visible where the splitting is.
     #[test]
-    fn test_word_spans_reads_ansi_c_quoting_as_ordinary_quoting() {
+    fn test_words_reads_ansi_c_quoting_as_ordinary_quoting() {
         let cmd = "D=$'ansi\\'c' git status";
-        let spans = word_spans(cmd);
         assert_ne!(
-            spans.len(),
+            words(cmd).len(),
             3,
             "if this ever splits into three words the limitation is gone and \
              the comment above should go with it"
@@ -1172,18 +1277,18 @@ mod tests {
     #[test]
     fn test_coalesce_words_merges_adjacent_tokens() {
         let cmd = "golangci-lint --config *.yml run";
-        let words: Vec<&str> = coalesce_words(cmd, &tokenize(cmd))
+        let merged: Vec<&str> = coalesce_words(cmd, tok_view(cmd, &tokenize(cmd)))
             .into_iter()
             .map(|(w, _)| w)
             .collect();
-        assert_eq!(words, vec!["golangci-lint", "--config", "*.yml", "run"]);
+        assert_eq!(merged, vec!["golangci-lint", "--config", "*.yml", "run"]);
     }
 
     #[test]
     fn test_coalesce_words_preserves_offsets() {
         let cmd = "a *.yml b";
-        let words = coalesce_words(cmd, &tokenize(cmd));
-        assert_eq!(words, vec![("a", 0), ("*.yml", 2), ("b", 8)]);
+        let merged = coalesce_words(cmd, tok_view(cmd, &tokenize(cmd)));
+        assert_eq!(merged, vec![("a", 0), ("*.yml", 2), ("b", 8)]);
     }
 
     #[test]
