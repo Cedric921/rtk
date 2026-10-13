@@ -102,7 +102,7 @@ pub(crate) fn resolved_tee_dir() -> Option<PathBuf> {
 /// comes from the test's own configuration. `cleanup_old_files` deletes from
 /// whatever this returns, so a test that sets either points it at a directory
 /// of its own.
-fn get_tee_dir(cfg: &RetrieverConfig) -> Option<PathBuf> {
+pub(crate) fn get_tee_dir(cfg: &RetrieverConfig) -> Option<PathBuf> {
     if let Some(dir) = user_env::var("RTK_TEE_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
@@ -183,7 +183,40 @@ fn write_tee_file(
 ) -> Option<PathBuf> {
     create_tee_dir(dir)?;
     let slug = sanitize_slug(slug);
-    let content = if raw.len() > max_file_size {
+    let (filepath, mut file) = create_unique_tee_file(dir, &slug)?;
+    use std::io::Write;
+    file.write_all(capped_content(raw, max_file_size).as_bytes())
+        .ok()?;
+    cleanup_old_files(dir, max_files);
+    Some(filepath)
+}
+
+pub(crate) fn write_named_tee_file(
+    raw: &str,
+    filename: &str,
+    dir: &Path,
+    max_file_size: usize,
+    max_files: usize,
+) -> Option<PathBuf> {
+    create_tee_dir(dir)?;
+    let filepath = dir.join(filename);
+    let mut file = crate::core::utils::open_private(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+        &filepath,
+    )
+    .ok()?;
+    use std::io::Write;
+    file.write_all(capped_content(raw, max_file_size).as_bytes())
+        .ok()?;
+    cleanup_old_files(dir, max_files);
+    Some(filepath)
+}
+
+fn capped_content(raw: &str, max_file_size: usize) -> String {
+    if raw.len() > max_file_size {
         let boundary = raw
             .char_indices()
             .take_while(|(i, _)| *i < max_file_size)
@@ -197,12 +230,7 @@ fn write_tee_file(
         )
     } else {
         raw.to_string()
-    };
-    let (filepath, mut file) = create_unique_tee_file(dir, &slug)?;
-    use std::io::Write;
-    file.write_all(content.as_bytes()).ok()?;
-    cleanup_old_files(dir, max_files);
-    Some(filepath)
+    }
 }
 
 fn display_path(path: &Path) -> String {
@@ -278,9 +306,13 @@ fn write(cfg: &RetrieverConfig, content: &str, slug: &str) -> Option<PathBuf> {
     )
 }
 
+pub(crate) fn format_hint(path: &Path) -> String {
+    format!("[full output: {}]", display_shell_path(path))
+}
+
 pub fn tee_and_hint(cfg: &RetrieverConfig, raw: &str, slug: &str) -> Option<String> {
     let path = write(cfg, raw, slug)?;
-    Some(format!("[full output: {}]", display_shell_path(&path)))
+    Some(format_hint(&path))
 }
 
 pub fn force_tee_hint(cfg: &RetrieverConfig, content: &str, slug: &str) -> Option<String> {
